@@ -1,0 +1,225 @@
+h1(#recuperacion). Fiabilidad y Recuperación
+
+h2. WAL - Write Ahead Log
+
+El método estándar que Postgres utiliza para garantizar la integridad de los datos es el uso de WAL (_Write-ahead logging_). También se usa para la replicación a través del envío de logs (_log shipping_). Dentro de los fuentes de Postgres se refiere también al WAL como _XLOG_.
+
+A la hora de producir modificaciones en la base de datos intervienen dos elementos: los datos a modificar y una entrada registro que informa de la operación que va a producirse. Este registro se denomina _WAL_ y se representa físicamente como un conjunto de archivos en el directorio @pg_xlog@ dentro del directorio de datos. Cada archivo de datos del WAL tiene un tamaño predeterminado de 16MB y se divide en segmentos de 8KB. Cada uno de los registros tiene la siguiente estructura, definida en "@xlog.h@":http://doxygen.postgresql.org/xlog_8h_source.html#l00041:
+
+<pre>
+typedef struct XLogRecord
+{
+    uint32      xl_tot_len;     /* total len of entire record */
+    TransactionId xl_xid;       /* xact id */
+    uint32      xl_len;         /* total len of rmgr data */
+    uint8       xl_info;        /* flag bits, see below */
+    RmgrId      xl_rmid;        /* resource manager for this record */
+    /* 2 bytes of padding here, initialize to zero */
+    XLogRecPtr  xl_prev;        /* ptr to previous record in log */
+    pg_crc32    xl_crc;         /* CRC for this record */
+
+    /* If MAXALIGN==8, there are 4 wasted bytes here */
+
+    /* ACTUAL LOG DATA FOLLOWS AT END OF STRUCT */
+
+} XLogRecord;
+</pre>
+
+Cada tipo de operación produce un registro distinto, por lo que la parte final de la estructura se reserva para guardar dichos datos.
+
+El funcionamiento básico del WAL se basa en la idea de que las entradas de registro deben garantizarse antes de empezar a modificar datos. De forma simplificada, esta garantía se consigue almacenando los registros de _log_ en disco y cada página de datos, ya venga esta del _heap_ o de un índice, se marca con un número de secuencia del registro de log que ha producido la modificación de datos (_LSN_, aunque en la práctica es una referencia al archivo físico donde se guarda el WAL).
+
+Una de las ventajas principales del WAL es que una vez se garantiza la entrada en el registro puede retrasarse la escritura de la página de datos en disco en función de la carga del servidor. Adicionalmente tiene la ventaja de que los registros del WAL pueden replicarse a otro servidor para producir copias de la base de datos sin mucho esfuerzo.
+
+Cuando el servidor entra en modo de recuperación procede a reproducir todos los registros del WAL que no hayan modificado datos en el disco, es decir, que se quedaron a mitad durante el fallo. De esta forma se comprueban los _LSNs_ de las páginas de datos para ver cuáles fueron aplicados y cuáles no. Si número de _LSN_ de la página es mayor o igual que último número de la entrada en el WAL se procede a la escritura.
+
+Las entradas del _log_ contienen siempre suficiente información para repetir cualquier modificación en una página de datos. Es importante señalar que todo el sistema se basa en la idea de que el sistema operativo proporciona una operación _atómica_ de escritura de datos en el disco, de forma que una página de datos no puede ser escrita de forma parcial.
+
+En Postgres es posible cambiar el método de sincronización con disco mediante el parámetro de configuración "@wal_sync_method@":http://www.postgresql.org/docs/9.2/static/runtime-config-wal.html#GUC-WAL-SYNC-METHOD. Cada método se define como constante en el archivo "@xlog.h@":http://doxygen.postgresql.org/xlog_8h_source.html#l00076:
+
+<pre>
+/* Sync methods */
+#define SYNC_METHOD_FSYNC       0
+#define SYNC_METHOD_FDATASYNC   1
+#define SYNC_METHOD_OPEN        2       /* for O_SYNC */
+#define SYNC_METHOD_FSYNC_WRITETHROUGH  3
+#define SYNC_METHOD_OPEN_DSYNC  4       /* for O_DSYNC */
+extern int  sync_method;
+</pre>
+
+h3. Checkpoints
+
+Un _checkpoint_ es un punto en una secuencia de transacciones donde se garantiza que los datos del _heap_ y los índices se han actualizado con toda la información disponible en el momento de producir el _checkpoint_. La documentación de Postgres tiene una explicación bastante concisa sobre el funcionamiento básico:
+
+bq. At checkpoint time, all dirty data pages are flushed to disk and a special checkpoint record is written to the log file. (The changes were previously flushed to the WAL files.) In the event of a crash, the crash recovery procedure looks at the latest checkpoint record to determine the point in the log (known as the redo record) from which it should start the REDO operation. Any changes made to data files before that point are guaranteed to be already on disk. Hence, after a checkpoint, log segments preceding the one containing the redo record are no longer needed and can be recycled or removed. (When WAL archiving is being done, the log segments must be archived before being recycled or removed.)
+
+Los registros del WAL también incluyen información de los distintos _checkpoints_ que han ido produciéndose en la base de datos como resultado de la ejecución de transacciones. El primer registro del WAL que afecta a una página en particular después de un _checkpoint_ almacena una copia completa de la página de datos, por lo que en este caso simplemente se restaura la copia en lugar de repetir toda la operación.
+
+h3. Escritura en el WAL
+
+El proceso de escritura en el WAL puede resumirse como:
+
+# Se adquiere un bloqueo explícito al buffer compartido que contiene las páginas de datos a modificar.
+# Se inicia un sección crítica para garantizar que en los siguientes tres pasos no existen errores. De ser así, se abortaría completamente el proceso de base de datos, ya que en este momento existen buffers compartidos con cambios que todavía no se han escrito en el _log_.
+# Se aplican los cambios requeridos a los buffers compartidos.
+# Los buffers modificados se marcan como sucios mediante la función "@MarkBufferDirty@":http://doxygen.postgresql.org/bufmgr_8c_source.html#l00970.
+# Si la relación requiere una escritura en el WAL, se crea un registro y se inserta mediante "@XLogInsert@":http://doxygen.postgresql.org/xlog_8h.html#a858ef9f13042078dfcb977d2ddffe9e9. El _LSN_ página de datos se actualiza con el valor que devuelve @XLogInsert@.
+# Se da por terminada la sección crítica y se liberan los buffers bloqueados.
+
+Aunque hay otras secciones de los fuentes donde puede comprobarse este procedimiento, vale la pena ver los pasos anteriormente descritos en código en la función "@log_newpage@":http://doxygen.postgresql.org/heapam_8c_source.html#l04548 en @backend/access/heap/heapam.c@, utilizado para escribir una página del _heap_ en el WAL.
+
+<pre>
+XLogRecPtr
+log_newpage(RelFileNode *rnode, ForkNumber forkNum, BlockNumber blkno,
+			Page page)
+{
+	xl_heap_newpage xlrec;
+	XLogRecPtr	recptr;
+	XLogRecData rdata[2];
+
+	/* NO ELOG(ERROR) from here till newpage op is logged */
+	START_CRIT_SECTION();
+
+	xlrec.node = *rnode;
+	xlrec.forknum = forkNum;
+	xlrec.blkno = blkno;
+
+	rdata[0].data = (char *) &xlrec;
+	rdata[0].len = SizeOfHeapNewpage;
+	rdata[0].buffer = InvalidBuffer;
+	rdata[0].next = &(rdata[1]);
+
+	rdata[1].data = (char *) page;
+	rdata[1].len = BLCKSZ;
+	rdata[1].buffer = InvalidBuffer;
+	rdata[1].next = NULL;
+
+	recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_NEWPAGE, rdata);
+
+	/*
+	 * The page may be uninitialized. If so, we can't set the LSN and TLI
+	 * because that would corrupt the page.
+	 */
+	if (!PageIsNew(page))
+	{
+		PageSetLSN(page, recptr);
+		PageSetTLI(page, ThisTimeLineID);
+	}
+
+	END_CRIT_SECTION();
+
+	return recptr;
+}
+</pre>
+
+h2. Replicación
+
+De forma básica existen tres opciones para replicar los datos a otros servidores, ya bien sea para repartir la carga o para garantizar la disponibilidad de los datos en caso de fallo: _PITR_, _Log Shipping_ y _Streaming Replication_.
+
+h3. Point In Time Recovery (PITR).
+
+Es el método introducido a partir de la versión 8 para realizar copias de la base de datos mientras está en funcionamiento. El archivado se realiza de forma continua y no es necesario parar ningún proceso para realizarlo. Postgres proporcionará los ficheros listos para archivar conforme estén disponibles.
+
+El funcionamiento se basa en proveer a Postgres un comando externo a ejecutar, a petición de la base de datos. El comando solo se invoca después de tener confirmados segmentos completos del WAL.
+
+No se requiere ningún requisito adicional y pueden utilizarse las herramientas básicas de cualquier instalación Unix (como tar o gzip). La restricción es que la herramienta debe ser capaz de archivar al ratio de escritura en el WAL, en caso de fallo del sistema todos aquellos datos no escritos (en _buffer_) se perderian.
+
+Para configurarlo es necesario establecer los siguientes parámetros:
+
+<pre>
+wal_level = archive
+archive_mode = on
+archive_command = 'test ! -f /mnt/nfs/backup/%f && cp %p /mnt/nfs/backup%f'
+</pre>
+
+En @archive_command@ especificaremos el comando de copia a realizar, que recibirá el parámetro _p_ con los ficheros disponibles.
+
+Para simplificar las copias de seguridad de un sistema online Postgres provee el comando "pg_basebackup":http://www.postgresql.org/docs/9.2/static/app-pgbasebackup.html.
+
+Un ejemplo básico del comando para hacer una copia de seguridad de la base de datos utilizada en el trabajo podría ser:
+
+<pre>
+$ pg_basebackup -h biblioteca -D /usr/local/pgsql/data
+</pre>
+
+Las desventajas de PITR están bien descritas "en la sección 24.3.7":http://www.postgresql.org/docs/9.2/static/continuous-archiving.html#CONTINUOUS-ARCHIVING-CAVEATS de la documentación de Postgres y pueden resumirse en:
+
+# El archivado continuo no considera los índices de tipo _Hash_, por lo que es necesario reindexar las tablas después de restaurar una copia.
+# Crear una base de datos modificando la _template_ puede producir que la restaurar datos se propagen cambios incorrectos. Se recomienda no modificar _templates_ mientras existen copias de seguridad ejecutandose.
+# De igual forma, las modificaciones en _tablespaces_ con copias de seguridad en curso pueden producir propagaciones incorrectas al restaurar copias, por lo que también se recomienda crear copias de la base de datos _después_ de modificar cualquier _tablespace_.
+
+Adicionalmente aunque no se especifica en la documentación, las tablas temporales tampoco son registradas en el WAL.
+
+h3. Log Shipping
+
+Desde la versión 8.3 de Postgres es posible crear una configuración de _warm standby_, donde un servidor secundario va recogiendo en segundo plano todos los registros del WAL para reconstruir una replica de la base de datos. El procedimiento se usa para mantener un segundo servidor disponible en caso de que el principal tenga problemas. Mientras un servidor está en _standby_ no puede aceptar consultas.
+
+La limitación más notable es que ambos servidores han de ser lo más similares posible, al menos en cuanto a _hardware_ se refiere. No es posible por ejemplo mezclar procesadores de 32 con 64 bits entre servidores replicados.
+
+Para configurar un servidor en modo _warm standby_ es necesario crear un archivo de comandos de recuperación (@recovery.conf@) y apuntar a un directorio donde residirán los archivos de registro que se usarán para la replicación.
+
+En el nodo primario:
+
+<pre>
+wal_level = 'archive'  
+</pre>
+
+En el secundario:
+
+<pre>
+standby_mode = 'on'
+restore_command = 'cp /path/to/archive/%f %p'
+</pre>
+
+Por defecto, cuando el servidor de Postgres arranca se restauran todas las operaciones del WAL pendientes antes de aceptar consultas. Una vez el proceso de recuperación termina se desbloquea el servidor. Estableciendo el modo de recuperación (@standby_mode@) a @on@ se garantiza que el servidor no termine el proceso de restauración aun habiendo consumido todos los registros del WAL pendientes.
+
+Los registros del WAL pueden proceder de tres orígenes distintos:
+
+# Archivo proveniente del ejecutable especificado en @restore_command@
+# Ficheros existentes en @pg_xlog@
+# Copiados mediante streaming vía TCP (punto siguiente)
+
+Postgres no provee ninguna herramienta para levantar un nodo secundario, ni para evitar que el primario vuelva a levantarse de nuevo. Para iniciar el proceso donde se marca un nodo secundario como principal, lo habitual es utilizar el comando "pg_ctl":http://www.postgresql.org/docs/9.2/static/app-pg-ctl.html. También es conveniente configurar la opción @trigger_file@ en @recovery.conf@, de forma que cuando esté presente el archivo especificado se iniciará el proceso de _failover_.
+
+h3. Streaming Replication
+
+Desde la versión 9 es posible realizar el proceso anteriormente descrito de forma continua y sin esperar a que el registro de WAL se rellene para iniciar la replicación. La ventaja más evidente es que permite que un nodo secundario del cluster acepte consultas de lectura (_hot standby_), con un pequeño retraso de sincronización entre el nodo primario y los secundarios.
+
+De echo, también a partir de la versión 9 es posible mantener nodos secundarios que acepten consultas sin necesidad de utilizar replicación en streaming, aunque el echo de mantener los datos continuamente replicados hace bastante conveniente esta opción.
+
+Para habilitarlo hay que configurar la opción @wal_level = 'hotstandby'@ en el nodo primario y @hot_standby = 'on'@ en los nodos secundarios.
+
+Por defecto la operación de réplica no es síncrona: el servidor primario no garantiza que una réplica contiene los datos antes de devolver el control de la transacción. Si bien puede ser una opción interesante en pro de la velocidad, podrían producirse situaciones no deseadas. Imaginemos la siguiente situación:
+
+# Existe una aplicación web que se compone de 3 servidores: el servidor web, el servidor primario de Postgres y un servidor secundario en modo solo lectura. Cualquier petición _de consulta_ a base de datos del servidor web puede enviarse tanto al primario como al secundario indistintamente.
+# Los datos entre el primario y secundario se replican de forma _asíncrona_.
+# En un momento dado, la página web decide autenticar a un usuario contra la información en base de datos. La información de la sesión del usuario se encuentra también almacenada aquí, por lo que la ausencia de dicha información significa que el usuario no ha sido autenticado.
+# El proceso de _login_ comprueba el usuario y la contraseña y si es correcta se registra una nueva sesión en la tabla de sesiones activas.
+# El navegador redirecciona a una nueva página web que requiere la información de sesión del usuario. Se lanza una consulta que el balanceador de carga dirige al nodo secundario de Postgres.
+# Debido al número de usuarios en el sistema, el uso del servidor primario es elevado y la réplica de información de la sesión no ha sido producida a tiempo. El servidor secundario tiene una versión antigua de la tabla de sesiones del usuario.
+# El proceso redirige, incorrectamente, al usuario a la página de _login_  de nuevo.
+
+La situación anterior se puede evitar activando la sincronización del WAL entre ambos. Cualquier transacción no se confirmará hasta que:
+
+# Los datos se han escrito en el WAL
+# Se ha confirmado la escritura de las páginas de datos implicadas _tanto en el primario como en el primero de los nodos secundarios_, la lista de _failover_ se establece mediante la opción de configuración @synchronous_standby_names@.
+
+Obviamente, las transacciones de sólo lectura y cualquier _rollback_ producido no requiere de esta sincronía.
+
+El proceso de replicación síncrono se puede establecer por transacción, estableciendo la opción @syncronous_commit@.
+
+h3. Resumen de los modos de escritura en el registro
+
+La opción @wal_level@ controla los modos de escritura en el WAL y puede establecerse en los siguientes valores:
+
+# *minimal*. Es la opción por defecto, utilizar solo para recuperación básica del servidor. Algunas operaciones, como la creación de índices por ejemplo, son más rápidas debido a que no se registran en el WAL. No se permite archivado continuo del log, ni replicación en streaming.
+# *archive*. Añade la posibilidad de archivar continuamente los logs y replicar en streaming, pero las réplicas se mantienen en _standby_. No permite consultas.
+# *hot_standby*. Añade información extra al registro de transacciones para permitir hacer consultas de sólo lectura en servidores secundarios.
+
+
+
+
+
+
+
+

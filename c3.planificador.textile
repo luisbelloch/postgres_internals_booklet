@@ -1,0 +1,326 @@
+h1(#planificador). El Planificador de Consultas
+
+Por cada una de las consultas ejecutadas, Postgres elabora un plan de ejecución para decidir cuál será la estrategia de acceso a datos más óptima a utilizar. Para ello, construye un plan de ejecución que describe las operaciones de acceso a disco y a memoria, y en qué orden han de ejecutarse estas. Básicamente se evalúan las siguientes tres áreas:
+
+# Qué estrategia de _joins_ utilizar: _nested loops_, _hash join_ o _merge join_.
+# Qué algoritmo de agregación: _hashing_ o _sorting_.
+# Qué algoritmo de _scan_: _index_, _bitmap_ o _sequential scan_.
+
+Tal y como hemos visto en capítulos anteriores, puede evaluarse el plan de ejecución de cualquier consulta mediante el comando "@EXPLAIN@":http://www.postgresql.org/docs/9.2/static/sql-explain.html. El comando @EXPLAIN@ no forma parte del estándar SQL. 
+
+Obtengamos pues un plan de ejecución un poco más complejo que los anteriores:
+
+<pre>
+biblioteca=# EXPLAIN VERBOSE SELECT * FROM voto v 
+biblioteca-#   INNER JOIN usuario u ON v.usuario = u.login
+biblioteca-#   INNER JOIN libro l ON v.libro = l.isbn;
+QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Hash Join  (cost=50.49..79.17 rows=416 width=742)
+   Output: v.usuario, v.libro, v.positivo, u.login, u.nombre, l.isbn, l.titulo, l.autor, l.stock, l.categoria
+   Hash Cond: ((v.libro)::text = (l.isbn)::text)
+   ->  Hash Join  (cost=12.93..35.89 rows=416 width=661)
+         Output: v.usuario, v.libro, v.positivo, u.login, u.nombre
+         Hash Cond: ((v.usuario)::text = (u.login)::text)
+         ->  Seq Scan on public.voto v  (cost=0.00..16.40 rows=640 width=97)
+               Output: v.usuario, v.libro, v.positivo
+         ->  Hash  (cost=11.30..11.30 rows=130 width=564)
+               Output: u.login, u.nombre
+               ->  Seq Scan on public.usuario u  (cost=0.00..11.30 rows=130 width=564)
+                     Output: u.login, u.nombre
+   ->  Hash  (cost=25.03..25.03 rows=1003 width=81)
+         Output: l.isbn, l.titulo, l.autor, l.stock, l.categoria
+         ->  Seq Scan on public.libro l  (cost=0.00..25.03 rows=1003 width=81)
+               Output: l.isbn, l.titulo, l.autor, l.stock, l.categoria
+(16 rows)
+</pre>
+
+En la salida proporcionada por Postgres podemos ver la estructura en árbol del plan. Los nodos de mayor profundidad representan siempre operaciones de acceso a la tabla o a los índices de la misma. Los nodos de menor profundidad suelen ser operaciones de mezcla o agregación de resultados intermedios. Los valores mostrados en los nodos superiores representan valores agregados de las operaciones contenidas en cada nodo.
+
+Como las operaciones de mayor coste son los accesos a disco, los planes de ejecución se evalúan siempre en base al coste de estas operaciones. La unidad de medida es arbitraria y se establece en la configuración del servidor. Por ejemplo, la unidad básica de acceso secuencial se establece por defecto a 1.0, mediante el parámetro "@seq_page_cost@":http://www.postgresql.org/docs/9.2/static/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS el resto operaciones pueden establecerse de forma relativa a esta cantidad.
+
+Los detalles del funcionamiento interno del planificador de consultas pueden obtenerse en el archivo "README":https://github.com/postgres/postgres/tree/master/src/backend/optimizer de la carpeta @backend/optimizer@ de los fuentes.
+
+h2. Paths: ¿Qué plan se elige?
+
+Un _path_ es una representación simplificada de un potencial árbol de ejecución.
+
+Internamente se crean múltiples _paths_ durante la planificación de la consulta para finalmente escoger uno que se convertirá en el plan a ejecutar. En líneas generales el proceso sigue los siguientes pasos:
+
+# Se genera una estructura de datos por cada posible método a realizar (_scans_ o _joins_). La estructura de datos puede verse en "@relation.h@":http://doxygen.postgresql.org/relation_8h_source.html#l00701
+# Los distintos _paths_ se evalúan comparando el coste para el mismo tipo de relación (o mismo tipo de _join_). Por ejemplo, en "@costsize.c#1237@":http://doxygen.postgresql.org/costsize_8c_source.html#l01237 tenemos la función que evalúa el coste de una ordenación, @cost_sort@.
+# Se descartan lo más pronto posible todos los _paths_ de nivel inferior:
+## Se mantienen los que son _baratos_ para ordenar la relación, ya sea en tiempo total o de inicio.
+## Las ordenaciones redundantes se eliminan.
+
+La función que construye y evalúa los distintos _paths_ se llama "@query_planner@":http://doxygen.postgresql.org/planmain_8c_source.html#l00090 y puede encontrarse en el archivo @backend/optimizer/plan/planmain.c@:
+
+<pre>
+void
+query_planner(PlannerInfo *root, List *tlist,
+              double tuple_fraction, double limit_tuples,
+              Path **cheapest_path, Path **sorted_path,
+              double *num_groups)
+{
+  ...
+</pre>
+
+h2. Cómo se decide el algoritmo de _scan_ a utilizar.
+
+Recordemos que ante una consulta, Postgres puede optar por utilizar _sequential scans_, _bitmap scans_ o _indexed scans_.
+
+Vamos a utilizar de nuevo la tabla _libro_ para comprobar distintos planes de ejecución en base a la información que tiene Postgres sobre los datos de la tabla. Mediante la siguiente consulta extraeremos la frecuencia de cada valor del stock de libros para tener una idea del uso aproximado:
+
+<pre>
+WITH libro (stock, count) AS (
+  SELECT stock, COUNT(*) 
+  FROM libro
+  GROUP BY 1)
+SELECT stock, count, (count * 100.0 / (SUM(count) OVER ()))::numeric(4,1) AS "%" FROM libro
+ORDER BY 2 DESC;
+
+ stock | count |  %  
+-------+-------+-----
+   930 |     5 | 0.5
+   962 |     4 | 0.4
+   ...
+</pre>
+
+El resultado se ha omitido por claridad, sabemos que un stock de 930 libros se da 5 veces y que en el final de los resultados un stock de 215 libros se da una sola vez ¿Qué efectos produce esto en el planificador de consultas?
+
+<pre>
+biblioteca=# explain select * from libro where stock = 930;
+                      QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Bitmap Heap Scan on libro  (cost=4.29..15.69 rows=5 width=86)
+   Recheck Cond: (stock = 930)
+   ->  Bitmap Index Scan on idx_libro_stock  (cost=0.00..4.29 rows=5 width=0)
+         Index Cond: (stock = 930)
+(4 rows)
+
+biblioteca=# explain select * from libro where stock = 215;
+QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Index Scan using idx_libro_stock on libro  (cost=0.00..8.27 rows=1 width=86)
+   Index Cond: (stock = 215)
+(2 rows)
+</pre>
+
+Como puede verse, los resultados varían en función de la distribución de datos que existe en la tabla. De forma generalizada, las reglas internas que usa Postgres para evaluar qué tipo de _scan_ utilizar son:
+
+# Cuando la distribución de los valores es muy amplia (en nuestro caso, hay muchos libros con un stock similar), el planificador de Postgres decide utilizar _sequential scans_. Pensándolo detenidamente tiene cierto sentido, pues la consulta devolverá gran cantidad de datos y por lo tanto será necesario acceder a la mayoría de las posiciones en disco.
+# En los casos en los que hay pocos valores puntuales en la tabla, se utiliza un _scan_ basado en índice. Nótese que las búsquedas que usan los índices creados implícitamente por las claves primarias de la tabla no tienen valores repetidos, por lo que la búsqueda mediante un índice es lo más optimo.
+# Cuando hay casos intermedios de distribución, se usa _bitmap scan_.
+
+Es posible forzar el uso de un _scan_ concreto mediante las instrucciones @enable_seqscan@ y @enable_bitmapscan@ al principio de la transacción. Otras opciones de configuración relevantes pueden encontrarse en la "sección 18.7":http://www.postgresql.org/docs/9.2/interactive/runtime-config-query.html de la documentación de Postgres sobre valores de configuración en tiempo de ejecución.
+
+Postgres guarda datos sobre el tamaño y uso de diversos objetos en la tablas @pg_class@ y @pg_statistics@. Para obtener una vista más legible se recomienda leer de la tabla @pg_stats@ en su lugar:
+
+<pre>
+biblioteca=# SELECT relname, relkind, reltuples, relpages FROM pg_class WHERE relname LIKE '%libro%';
+       relname        | relkind | reltuples | relpages 
+----------------------+---------+-----------+----------
+ pk_libro             | i       |      1003 |        9
+ libro                | r       |      1003 |       15
+ idx_libro_stock      | i       |      1003 |       19
+ idx_libro_categoria  | i       |      1003 |        7
+ idx_libro_isbn_stock | i       |      1003 |        7
+(5 rows)
+
+biblioteca=# SELECT attname, inherited, n_distinct, array_to_string(most_common_vals, E'\n') as most_common_vals FROM pg_stats WHERE tablename = 'libro' and attname = 'stock';
+ attname | inherited | n_distinct | most_common_vals 
+---------+-----------+------------+------------------
+ stock   | f         |  -0.619143 | 930             +
+         |           |            | 331             +
+         |           |            | 962             +
+ ...
+</pre>
+
+La anterior consulta coincide con nuestra estimación inicial. Hay mucha más información sobre la estimación del tamaño de las filas de una tabla en el "capítulo 58":http://www.postgresql.org/docs/9.2/static/row-estimation-examples.html de la documentación de Postgres.
+
+h2. Cómo se decide qué algoritmo de _join_ se debe utilizar
+
+Ante una operación de _join_ entre varias tablas, el planificador puede optar por utilizar _nested loops_, _hash joins_ o _merge joins_.
+
+h3. Nested Loops
+
+La opción menos eficiente, y más sencilla de implementar, es realizar la _join_ utilizando todos los elementos de ambas partes.
+
+Visualmente puede representarse como un comprobación de _todos los elementos con todos_:
+
+!nested-loop-join.png!
+
+En pseudo-código para un _join_ secuencial es bastante directo:
+
+<pre>
+for (i = 0; i < length(outer); i++)
+  for (j = 0; j < length(inner); j++)
+    if (outer[i] == inner[j]) 
+      output(outer[i], inner[j]);
+</pre>
+
+La función podemos encontrarla en los fuentes en @backend/optimizer/plan/createplan.c@, en la función "@create_nestedloop_plan@":https://github.com/postgres/postgres/blob/master/src/backend/optimizer/plan/createplan.c#L2015. Nótese que la función sólo define el plan de ejecución, no la ejecución en si, por lo que no existe traducción directa del pseudo-código previo.
+
+Para los ejemplos crearemos la vista @votos_por_usuario@, que muestra una lista de usuarios, libros y el voto que le ha dado cada usuario al libro.
+
+<pre>
+CREATE VIEW votos_por_usuario AS
+SELECT u.nombre, l.titulo, positivo 
+FROM usuario u 
+INNER JOIN voto v ON u.login = v.usuario 
+INNER JOIN libro l ON l.isbn = v.libro;
+</pre>
+
+Para forzar un _nested loop_ podemos realizar una búsqueda en la vista que fuerce a Postgres a comprobar todos los elementos de la relación - por ejemplo, buscaremos los nombres que empiecen por '_Jack_':
+
+<pre>
+biblioteca=# SELECT * FROM votos_por_usuario WHERE nombre LIKE 'Jack%';
+    nombre    |               titulo                | positivo 
+--------------+-------------------------------------+----------
+ Jack Sparrow | Learn You a Haskell for Great Good! | t
+ Jack Sparrow | Programming in Haskell              | f
+(2 rows)
+</pre>
+
+Analizando la consulta, vemos que efectivamente el planificador ha decidido comprobar todos los registros dentro de una _nested join_:
+
+<pre>
+biblioteca=# EXPLAIN SELECT * FROM votos_por_usuario WHERE nombre like 'Jack%';
+QUERY PLAN
+--------------------------------------------------------------------------------
+   Nested Loop  (cost=4.27..24.29 rows=3 width=534)
+     ->  Nested Loop  (cost=4.27..23.04 rows=3 width=565)
+           ->  Seq Scan on usuario u  (cost=0.00..11.62 rows=1 width=564)
+                 Filter: ((nombre)::text ~~ 'Jack%'::text)
+           ->  Bitmap Heap Scan on voto v  (cost=4.27..11.37 rows=3 width=97)
+                 Recheck Cond: ((usuario)::text = (u.login)::text)
+                 ->  Bitmap Index Scan on pk_voto  (cost=0.00..4.27 rows=3 width=0)
+                       Index Cond: ((usuario)::text = (u.login)::text)
+     ->  Index Scan using idx_libro_isbn_stock on libro l  (cost=0.00..0.41 rows=1 width=31)
+           Index Cond: ((isbn)::text = (v.libro)::text)
+  (10 rows)
+</pre>
+
+h3. Hash Joins
+
+_Hash join_ se basa en crear _hashes_ para los dos elementos de la relación, y poder así realizar las comprobaciones sin examinar todas las tuplas de la condición.
+
+!hash-join.png!
+
+Producir un _hash join_ en los ejemplos anteriores es sencillo, pues basta con utilizar la vista @votos_por_usuario@:
+
+<pre>
+biblioteca=# explain select * from votos_por_usuario;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Hash Join  (cost=46.49..75.17 rows=416 width=534)
+   Hash Cond: ((v.libro)::text = (l.isbn)::text)
+   ->  Hash Join  (cost=12.93..35.89 rows=416 width=565)
+         Hash Cond: ((v.usuario)::text = (u.login)::text)
+         ->  Seq Scan on voto v  (cost=0.00..16.40 rows=640 width=97)
+         ->  Hash  (cost=11.30..11.30 rows=130 width=564)
+               ->  Seq Scan on usuario u  (cost=0.00..11.30 rows=130 width=564)
+   ->  Hash  (cost=21.03..21.03 rows=1003 width=31)
+         ->  Seq Scan on libro l  (cost=0.00..21.03 rows=1003 width=31)
+(9 rows)
+</pre>
+
+Nótese que la cláusula de la cual está realizando el _hash_ viene marcada con _Hash Cond_ en el resultado de @EXPLAIN@ y corresponde a la condición de la vista @ON u.login = v.usuario@.
+
+El pseudo-código que representa el plan de ejecución quedaría como:
+
+<pre>
+for (j = 0; j < length(inner); j++)
+  hash_key = hash(inner[j]);
+  append(hash_store[hash_key], inner[j]);
+for (i = 0; i < length(outer); i++)
+  hash_key = hash(outer[i]);
+  for (j = 0; j < length(hash_store[hash_key]); j++)
+    if (outer[i] == hash_store[hash_key][j])
+      output(outer[i], inner[j]);
+</pre>
+
+En el código fuente, los _hash joins_ se crean mediante la función "@create_hashjoin_plan@":https://github.com/postgres/postgres/blob/master/src/backend/optimizer/plan/createplan.c#L2401 en el archivo @createplan.c@.
+
+En versiones posteriores requería todos los _hashes_ en memoria, pero a partir de la versión 9.1 se introdujo la posibilidad de ir escaneando la tabla en mitad del proceso de búsqueda. El _commit_ que introdujo dichos cambios puede "examinarse aqui":http://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=f4e4b3274317d9ce30de7e7e5b04dece7c4e1791.
+
+h3. Merge Joins
+
+Cuando ambos pares de la relación están ordenados, es posible reducir el número de comprobaciones a realizar. Es más cómodo de ver con un diagrama:
+
+!merge-join.png!
+
+Para producir un _merge join_ podemos crear dos tablas con enteros e intentar la unión de ambas:
+
+<pre>
+biblioteca=# CREATE TABLE AA (id integer NOT NULL);
+CREATE TABLE
+biblioteca=# CREATE TABLE BB (id integer NOT NULL);
+CREATE TABLE
+biblioteca=# EXPLAIN SELECT * FROM AA a INNER JOIN BB b ON a.id = b.id;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Merge Join  (cost=337.49..781.49 rows=28800 width=8)
+   Merge Cond: (a.id = b.id)
+   ->  Sort  (cost=168.75..174.75 rows=2400 width=4)
+         Sort Key: a.id
+         ->  Seq Scan on aa a  (cost=0.00..34.00 rows=2400 width=4)
+   ->  Sort  (cost=168.75..174.75 rows=2400 width=4)
+         Sort Key: b.id
+         ->  Seq Scan on bb b  (cost=0.00..34.00 rows=2400 width=4)
+(8 rows)
+</pre>
+
+El pseudo-código que representa la ejecución del plan es una poco más complejo.
+
+<pre>
+sort(outer);
+sort(inner);
+i=0; j=0;
+save_j = 0;
+while (i < length(outer))
+  if (outer[i] == inner[j])
+    output(outer[i], inner[j]);
+  if (outer[i] <= inner[j] && j < length(inner))
+    j++;
+  if (outer[i] < inner[j])
+    save_j = j;
+else
+  i++;
+  j = save_j;
+</pre>
+
+Internamente los planes de ejecución para _merge joins_ se construyen en la función "@create_mergejoin_plan@":https://github.com/postgres/postgres/blob/master/src/backend/optimizer/plan/createplan.c#L2106 en el archivo @createplan.c@.
+
+h3. Comparación de Nested, Merge y Hash Joins
+
+Resumiremos a continuación cuándo decide el planificador utilizar cada uno de los métodos de _join_ anteriormente descritos:
+
+* _Nested join_ se utiliza cuando existen condiciones en la _join_ que obligan comprobar las dos partes de la relación por completo. _Todos con todos_.
+
+* _Merge join_ se utiliza cuando es posible ordenar las dos partes de la relación para reducir el número de pares a comprobar.
+
+* _Hash join_ se utiliza cuando la ordenación de las dos partes de la relación es costosa y podemos realizar _hashing_ de al menos una de las dos partes de forma eficiente.
+
+La decisión sobre qué tipo de _join_ utilizar se encuentra en la función "@create_join_plan@":https://github.com/postgres/postgres/tree/master/src/backend/optimizer/plan/createplan.c#L598 en el archivo @createplan.c@ de los fuentes.
+
+h2. Nota sobre discos SSD
+
+Dado que la operación con mayor coste es el acceso a disco, Postgres considera en este sentido dos tipos de operaciones distintas: el acceso aleatorio y el secuencial. Tradicionalmente se ha considerado el acceso aleatorio como mayor coste que el secuencial, debido principalmente a la rotación física de los discos y la cantidad de movimientos de la cabeza de lectura que produce un acceso aleatorio.
+
+Con la proliferación de los discos de estado sólido, basados en memoria de acceso aleatorio, es posible que el planificador incurra en errores de evaluación al considerar mayor el coste aleatorio que el secuencial. Para una instalación por defecto, el valor de @random_page_cost@ se establece en 4.0. Algunos vendedores como Amazon o Heroku recomiendan establecer dicho valor entre 1.1 y 2.0 para instalaciones basadas en SSD.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

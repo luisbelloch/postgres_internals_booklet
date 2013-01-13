@@ -1,0 +1,28 @@
+h1(#bibliografia). Bibliografía
+
+[FEKETE] A. Fekete et al. _Making Snapshot Isolation Serializable_. In ACM Transactions on Database Systems 30:2, Jun. 2005. http://dx.doi.org/10.1145/1071610.1071615
+
+[HELLERSTEIN95] Joseph M. Hellerstein, Jeffrey F. Naughton, and Avi Pfeffer. 1995. _Generalized Search Trees for Database Systems_. In Proceedings of the 21th International Conference on Very Large Data Bases (VLDB '95).
+
+[HERKMVCC] _PostgreSQL Concurrency With MVCC_. Heroku Developer Center. Nov 2012. https://devcenter.heroku.com/articles/postgresql-concurrency
+
+[LANIN86] V. Lanin and D. Shasha, _A Symmetric Concurrent B-Tree Algorithm_,
+Proceedings of 1986 Fall Joint Computer Conference, pp 380-389
+
+[LEHMAN81] P. Lehman and S. Yao, _Efficient Locking for Concurrent Operations on B-Trees_, ACM Transactions on Database Systems, Vol 6, No. 4, December 1981, pp 650-670)
+
+[MELTON01] Jim Melton, Jan-Eike Michels, Vanja Josifovski, Krishna Kulkarni, Peter Schwarz, and Kathy Zeidenstein. 2001. _SQL and management of external data_. SIGMOD Rec. 30, 1 (March 2001), 70-77. DOI=10.1145/373626.373709 http://doi.acm.org/10.1145/373626.373709
+
+[MELTON02] Jim Melton, Jan Eike Michels, Vanja Josifovski, Krishna Kulkarni, and Peter Schwarz. 2002. _SQL/MED: a status report_. SIGMOD Rec. 31, 3 (September 2002), 81-89. DOI=10.1145/601858.601877 http://doi.acm.org/10.1145/601858.601877
+
+[PGDOCS] _PostgreSQL 9.2 Documentation_. PostgresSQL Official Web Site. http://postgresql.org/docs/9.2/static/
+
+[PGDEVBOOK] Ewald Geschwinde and Hans-Juergen Schonig. 2001. _Postgresql Developer's Handbook_. Sams, Indianapolis, IN, USA.
+
+[PGWIKI_SQLMED] _SQL/MED_. PostgresSQL Wiki. March 2012 http://wiki.postgresql.org/wiki/SQL/MED
+
+[STONEBRAKER86] Michael Stonebraker and Lawrence A. Rowe. 1986. _The design of POSTGRES_. In Proceedings of the 1986 ACM SIGMOD international conference on Management of data (SIGMOD '86), Carlo Zaniolo (Ed.). ACM, New York, NY, USA, 340-355. DOI=10.1145/16894.16888 http://doi.acm.org/10.1145/16894.16888
+
+[STONEBRAKER90] M. Stonebraker, L. A. Rowe, and M. Hirohama. 1990. _The Implementation of POSTGRES_. IEEE Trans. on Knowl. and Data Eng. 2, 1 (March 1990), 125-142
+
+[SELTZER91] Margo Seltzer and Ozan Yigit, _A New Hashing Package for UNIX_, Proceedings of the Winter USENIX Conference, January 1991.

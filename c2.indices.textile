@@ -1,0 +1,233 @@
+h1(#indices). Índices
+
+Postgres soporta distintos tipos de índices en función de la mejora que intentemos conseguir sobre nuestras consultas. Los tipos disponibles, de los que hablaremos más adelante, son: _Btree_, _Hash_, _GiST_, _SP-GiST_ y _GIN_.
+
+h2. Funcionamiento básico
+
+Veamos un ejemplo sobre las ventajas de aplicar índices en las tablas. La siguiente consulta sobre el esquema de prueba extrae todos los libros de los cuales no quedan ejemplares (_stock_ = 0):
+
+<pre>SELECT * FROM libro WHERE stock = 0;</pre>
+
+La consulta tiene el inconveniente obvio de producir un _scan_ completo de la tabla, por lo que en cuanto crezca el número de libros o el número de consultas bajará considerablemente el rendimiento de la aplicación. Un simple vistazo al plan de la consulta con @EXPLAIN@ nos da el scan completo, marcado con _Seq Scan_:
+
+<pre>
+biblioteca=# EXPLAIN SELECT * FROM libro WHERE stock = 0;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Seq Scan on libro  (cost=0.00..10.88 rows=1 width=1084)
+   Filter: (stock = 0)
+(2 rows)
+</pre>
+
+Un _scan_ implica recorrer todos y cada uno de los registros de la tabla en busca del dato pedido, lo que en la mayoría de los casos no es una operación rápida.
+
+Para evitarlo, podemos crear un índice sobre la columna _stock_ de la siguiente forma:
+
+<pre>CREATE INDEX idx_libro_stock ON libro (stock);</pre>
+
+Con lo que subsecuentes consultas con filtros sobre la columna _stock_ podrán utilizar el índice creado. Haciendo uso de @EXPLAIN@ de nuevo vemos que en este caso se produce un scan del índice (marcado con _Index Scan_):
+
+<pre>
+biblioteca=# EXPLAIN SELECT stock FROM libro WHERE stock = 0;
+                                 QUERY PLAN                                  
+-----------------------------------------------------------------------------
+ Index Scan using idx_libro_stock on libro  (cost=0.00..8.27 rows=1 width=4)
+   Index Cond: (stock = 0)
+(2 rows)
+</pre>
+
+El código que define los distintos tipos de índices soportados se guarda en la carpeta "_backend/access_":https://github.com/postgres/postgres/tree/master/src/backend/access de los fuentes de Postgres.
+
+También es interesante ver la función que estima el coste de los índices, llamada "@cost_index@":https://github.com/postgres/postgres/blob/master/src/backend/optimizer/path/costsize.c#L240, que se encuentra en @backend/optimizer/path/costsize.c@.
+
+En los siguientes puntos veremos el funcionamiento interno de cada tipo de índice.
+
+h2. Hash
+
+Es un tipo de índice basado en el trabajo de [Seltzer91], el cual consiste en guardar una correspondencia entre el _hash_ realizado al valor del índice y una de las divisiones del índice, comúnmente llamadas _buckets_. Si no existe espacio suficiente en uno de los _buckets_, se realiza una búsqueda de una página adicional (overflow page) para realizar la inserción. 
+
+A partir de la línea 120 de @hashinsert.c@ se ve con más claridad la inserción de una clave nueva:
+
+<pre>
+/* Do the insertion */
+while (PageGetFreeSpace(page) < itemsz)
+{
+	/*
+	 * no space on this page; check for an overflow page
+	 */
+	BlockNumber nextblkno = pageopaque->hasho_nextblkno;
+
+	if (BlockNumberIsValid(nextblkno))
+	{
+		/*
+		 * ovfl page exists; go get it.  if it doesn't have room, we'll
+		 * find out next pass through the loop test above.
+		 */
+		_hash_relbuf(rel, buf);
+		buf = _hash_getbuf(rel, nextblkno, HASH_WRITE, LH_OVERFLOW_PAGE);
+		page = BufferGetPage(buf);
+	}
+	else
+	{
+		/*
+		 * we're at the end of the bucket chain and we haven't found a
+		 * page with enough room.  allocate a new overflow page.
+		 */
+
+		/* release our write lock without modifying buffer */
+		_hash_chgbufaccess(rel, buf, HASH_READ, HASH_NOLOCK);
+
+		/* chain to a new overflow page */
+		buf = _hash_addovflpage(rel, metabuf, buf);
+		page = BufferGetPage(buf);
+
+		/* should fit now, given test above */
+		Assert(PageGetFreeSpace(page) >= itemsz);
+	}
+	pageopaque = (HashPageOpaque) PageGetSpecialPointer(page);
+	Assert(pageopaque->hasho_flag == LH_OVERFLOW_PAGE);
+	Assert(pageopaque->hasho_bucket == bucket);
+}
+</pre>
+
+La función de búsqueda (ver "@_hash_step@":https://github.com/postgres/postgres/blob/master/src/backend/access/hash/hashsearch.c#L280 en @hashsearch.c@) es bastante sencilla y utiliza búsqueda binaria simple para establecer la comparación, por lo que asume que los valores del _hash_ se almacenan de forma ordenada. Las funciones de comparación de claves pueden verse en @hashutil.c@.
+
+Como consecuencia del uso de _hashes_ para establecer el índice, éste sólo puede ser utilizado en operaciones de igualdad. Tampoco soporta múltiples columnas.
+
+h2. B-tree
+
+Es el tipo de índice por defecto, permite operaciones de comparación, igualdad y inclusión/exclusión en rango mediante los operadores @between@ e @in@. 
+
+Por la propia naturaleza de los _B-trees_, el índice es posible utilizarlo también para realizar ordenaciones de los datos, aunque no he podido encontrar referencias en el código del uso de ordenaciones usando índices _B-tree_.
+
+Por defecto al crear un índice se creará de tipo @btree@. Igualmente, todas las claves primarias crean un índice de tipo @btree@:
+
+<pre>
+biblioteca=# CREATE TABLE test1 (id integer NOT NULL PRIMARY KEY);
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test1_pkey" for table "test1"
+CREATE TABLE
+
+biblioteca=# \d test1_pkey
+   Index "public.test1_pkey"
+ Column |  Type   | Definition 
+--------+---------+------------
+ id     | integer | id
+primary key, btree, for table "public.test1"
+</pre>
+
+Los índices @btree@ aceptan múltiples columnas en su definición. El número máximo de columnas por índice se establece en 32, aunque puede ser modificado en tiempo de compilación. 
+
+El orden de búsqueda dentro del índice sigue el orden establecido al definir las columnas del índice. Por ejemplo, si creáramos un índice compuesto para la tabla _libro_, con las columnas _isbn_ y _stock_, cualquier consulta que utilizase dicho índice requeriría un par de scans completos de ambas columnas en el índice - las comprobaciones no se realizan de forma simultánea:
+
+<pre>
+biblioteca=# CREATE INDEX idx_libro_isbn_stock ON libro (isbn, stock);
+CREATE INDEX
+biblioteca=# EXPLAIN SELECT * FROM libro WHERE isbn like '59781%' AND stock < 10;
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Bitmap Heap Scan on libro  (cost=4.35..20.05 rows=1 width=81)
+   Recheck Cond: (stock < 10)
+   Filter: ((isbn)::text ~~ '59781%'::text)
+   ->  Bitmap Index Scan on idx_libro_stock  (cost=0.00..4.35 rows=13 width=0)
+         Index Cond: (stock < 10)
+(5 rows)
+</pre>
+
+La implementación se basa en el artículo original de Lehman y Yao [LEHMAN81] sobre la gestión de índices concurrentes. La diferencia más notable frente a la implementación original de Lehman y Yao es que esta no requería bloqueos de lectura asumiendo que las copias de las páginas de los arboles no se compartían.
+
+Debido a que Postgres comparte búfferes de memoria entre _backeds_ es necesario garantizar mediante bloqueos que ningún registro se modifica mientras se está examinando.
+
+En la línea 1008 de "@nbtsearch.c@":https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/nbtsearch.c#L1006 puede verse uno de estos bloqueos realizado antes de obtener el siguiente elemento dentro del scan del índice (en @_bt_scan.c@)
+
+<pre>
+/* We must acquire lock before applying _bt_steppage */
+Assert(BufferIsValid(so->currPos.buf));
+LockBuffer(so->currPos.buf, BT_READ);
+if (!_bt_steppage(scan, dir))
+	return false;
+/* Drop the lock, but not pin, on the new page */
+LockBuffer(so->currPos.buf, BUFFER_LOCK_UNLOCK);
+</pre>
+
+h2. GiST
+
+Es el tipo de índice más peculiar, pues permite definir distintas estrategias de acceso a la información al configurarlo. La implementación de GiST (_Generalized Search Tree_) está basada en árboles balanceados, por lo que es posible implementar encima búsquedas mediante _R-trees_, _B-trees_, _hB-trees_ y otros tipos similares de estructuras.
+
+Es posible obtener distintas implementaciones de algoritmos basados en GiST desde la "página de Teodor Sigaev y Oleg Bartunov":http://www.sai.msu.su/~megera/postgres/gist/.
+
+Como ejemplo de indices GiST ampliaremos nuestra tabla de libros para categorizar las entradas disponibles. Añadiremos una columna _categoría_ que permitirá por ejemplo clasificar un libro en la sub-categoría _haskell_, dentro de la categoría _programación_. Esto nos permitirá escribir consultas del tipo _obtener libros de programación de cualquier lenguaje_. Para ello, haremos uso del tipo de datos "ltree":http://www.postgresql.org/docs/9.2/static/ltree.html
+
+<pre>
+biblioteca=# CREATE EXTENSION "ltree";
+CREATE EXTENSION
+biblioteca=# ALTER TABLE libro ADD categoria ltree NULL;                       
+ALTER TABLE
+biblioteca=# UPDATE libro SET categoria = 'programacion.haskell' WHERE titulo LIKE '%Haskell%';
+UPDATE 2
+biblioteca=# SELECT titulo, categoria FROM libro WHERE categoria <@ 'programacion';
+                titulo                 |      categoria       
+---------------------------------------+----------------------
+ 'Learn You a Haskell for Great Good!' | programacion.haskell
+ 'Programming in Haskell'              | programacion.haskell
+(2 rows)
+</pre>
+
+El tipo de datos _ltree_ define el operador _<@_ para realizar búsquedas dentro del árbol, junto con muchos otros disponibles. Si echamos un vistazo a la tabla _pg_opclass_ podemos comprobar las operaciones dadas de alta en el catálogo:
+
+<pre>
+biblioteca=# select * from pg_opclass where opcname = 'gist_ltree_ops';
+ opcmethod |    opcname     | opcnamespace | opcowner | opcfamily | opcintype | opcdefault | opckeytype 
+-----------+----------------+--------------+----------+-----------+-----------+------------+------------
+       783 | gist_ltree_ops |         2200 |       10 |     32919 |     32828 | t          |      32908
+(1 row)
+</pre>
+
+Podemos entonces crear indices de tipo GiST sobre la columna definida anteriormente:
+
+<pre>CREATE INDEX idx_libro_categoria ON libro USING GiST (categoria);</pre>
+
+Postgres utilizará automáticamente el indice al realizar algún filtro con los operadores definidos para _ltree_:
+
+<pre>
+biblioteca=# EXPLAIN SELECT * FROM libro WHERE categoria <@ 'programacion';
+QUERY PLAN                                    
+----------------------------------------------------------------------------
+Index Scan using idx_libro_categoria on libro  (cost=0.00..8.27 rows=1 width=49)
+   Index Cond: (categoria <@ 'programacion'::ltree)
+(2 rows)
+</pre>
+
+h2. Estructuras internas
+
+La información sobre los índices existentes se guarda en las tablas @pg_indexes@ y @pg_index@. Un vistazo rápido a @pg_indexes@ combinado con la función @pg_relation_size@  muestra información sobre los índices disponibles en la tabla _libro_ y su tamaño:
+
+<pre>
+biblioteca=# SELECT * FROM pg_indexes WHERE tablename = 'libro';
+ schemaname | tablename |    indexname    | tablespace |                         indexdef                          
+------------+-----------+-----------------+------------+-----------------------------------------------------------
+ public     | libro     | pk_libro        |            | CREATE UNIQUE INDEX pk_libro ON libro USING btree (isbn)
+ public     | libro     | idx_libro_stock |            | CREATE INDEX idx_libro_stock ON libro USING btree (stock)
+ 
+biblioteca=# SELECT pg_relation_size('idx_libro_stock');
+ pg_relation_size 
+------------------
+          155648
+(1 row)
+</pre>
+
+Otras entradas del catálogo guardan distinta información sobre los tipos de índices disponibles y su acceso:
+
+* _pg_class_ mantiene información sobre las relaciones físicas de un índice, como la tabla TOAST por ejemplo (_reltoastrelid_).
+* _pg_am_ guarda información sobre los métodos de acceso disponibles para cada tipo de índice disponible.
+* _pg_opfamily_, _pg_opclass_, _pg_amop_ y _pg_amproc_ guardan información sobre los tipos de operadores disponibles por cada tipo de índice.
+
+
+h2. ¿Cuándo usar cada tipo de índice?
+
+En este capítulo hemos mostrado 3 tipos de índices: _Hash_, _GiST_ y _B-tree_, en función de las necesidades podemos usarlos para:
+
+* *Hash*. Usar como referencia para implementar otros índices, tiene problemas con la replicación del WAL.
+* *GiST*. Existen estructuras de datos complejas o deseamos implementar tipos de operadores específicos que requieren recorrer de concreta el índice.
+* *B-tree*. Uso _convencional_, no existen necesidades especiales concretas. 
+
+

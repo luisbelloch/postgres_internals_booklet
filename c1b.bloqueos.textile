@@ -1,0 +1,94 @@
+h2(#bloqueos). Bloqueos y MVCC
+
+Internamente Postgres utiliza un modelo de concurrencia basado en MVCC (_Multiversion Concurrency Control_). La filosofía detrás de la implementación es producir que los procesos de _lectura_ no bloqueen los de _escritura_ y viceversa.
+
+MVCC se basa en mantener copias distintas de los datos (_snapshots_) durante la ejecución de las transacciones, de forma que se controla qué copia en concreto es visibles para cada transacción. Dichas copias se realizan al inicio de transacciones con nivel de aislamiento @read commited@ y @serializable@. El proceso intenta mantener en todo momento las siguientes reglas de visibilidad de los datos:
+
+* Cada consulta puede ver únicamente transacciones completadas antes de iniciar la consulta.
+* Los datos modificados por múltiples consultas dentro de una misma transacción son visibles para el resto de consultas de dicha transacción.
+
+Por cada _snapshot_ Postgres guarda internamente un contador de transacciones y una lista de transacciones en curso para mantener dichas reglas de visibilidad entre transacciones.
+
+En cuanto al código, las reglas que rigen la visibilidad de las tuplas pueden consultarse en "tqual.c":https://github.com/postgres/postgres/blob/master/src/backend/utils/time/tqual.c en @src/backend/utils/time@. Aunque pueden parecer complejas se pueden resumir de la siguiente manera:
+
+#  Las tuplas en base de datos marcadas como visibles por otra transacción deben tener asociada una transacción que a) haya sido confirmada, b) con un Id menor que el contador actual de transacciones y c) no tiene el estado @in-proccess@ al inicio de la consulta. En adelante referiremos a este Id de transacción mediante @Xmin@.
+# Adicionalmente, las tuplas también tienen asociada un identificador de _expiración_ de transacción que a) esté en blanco o con el estado @aborted@, b) con un Id mayor que el contador de transacciones y c) que tiene el estado @in-proces@ antes del inicio de la consulta. Igualmente en adelante referiremos a dicho identificador con @Xmax@.
+
+Cada una de las las funciones en @tqual.c@ define un conjunto de reglas distinto dependiendo de la operación a ejecutar y el estado de la base de datos. Es interesante pues dar un pequeño repaso por cada una ellas para entender qué operaciones están involucradas en el control de la visibilidad:
+
+* *HeapTupleSatisfiesMVCC* - visible to supplied snapshot, excludes current command
+* *HeapTupleSatisfiesNow* - visible to instant snapshot, excludes current command
+* *HeapTupleSatisfiesUpdate* - like @HeapTupleSatisfiesNow@, but with user-supplied command, counter and more complex result
+* *HeapTupleSatisfiesSelf* - visible to instant snapshot and current command
+* *HeapTupleSatisfiesDirty* - like @HeapTupleSatisfiesSelf@, but includes open transactions
+* *HeapTupleSatisfiesVacuum* - visible to any running transaction, used by VACUUM
+* *HeapTupleSatisfiesToast* - visible unless part of interrupted vacuum, used for TOAST
+* *HeapTupleSatisfiesAny* - all tuples are visible
+
+Para comprobar el funcionamiento de MVCC con un ejemplo en tablas, vamos a instalar el módulo @page_inspect@ que tiene las funciones @heap_page_items@ y @get_raw_page@. La extensión viene por defecto en Postgres.
+
+<pre>
+biblioteca=# CREATE EXTENSION pageinspect;
+</pre>
+
+A continuación simularemos la compra de un libro por parte de un usuario, y consultaremos los valores de @xmin@ y @xmax@:
+
+<pre>
+biblioteca=# INSERT INTO COMPRA (usuario, libro, precio) VALUES ('mike', '9781593272838', '15.99');
+INSERT 0 1
+biblioteca=# SELECT t_xmin, t_xmax FROM heap_page_items(get_raw_page('compra', 0));
+ t_xmin | t_xmax 
+--------+--------
+   1683 |      0
+(1 row)
+</pre>
+
+Supongamos ahora que eliminamos dichos datos y volvemos a realizar la misma inserción.
+
+<pre>
+biblioteca=# DELETE FROM compra;
+DELETE 1
+biblioteca=# INSERT INTO compra (usuario, libro, precio) VALUES ('mike', '9781593272838', '15.99');
+INSERT 0 1
+biblioteca=# SELECT t_xmin, t_xmax FROM heap_page_items(get_raw_page('compra', 0));
+ t_xmin | t_xmax 
+--------+--------
+   1683 |   1684
+   1685 |      0
+(2 rows)
+</pre>
+
+En el estado actual podemos iniciar entonces una nueva transacción y durante su ejecución consultar el estado de @xmin@ y @xmax@. Nótese que la consulta la realizamos de forma externa a la transacción actual ejecutando desde el shell de @psql@ el propio @psql@ mediante @\!@.
+
+<pre>
+BEGIN WORK;
+DELETE FROM compra;
+SELECT xmin, xmax, * FROM compra;
+\! psql -h localhost -d biblioteca -e -c "SELECT xmin, xmax, * FROM compra;"
+SELECT txid_current();
+COMMIT WORK;
+</pre>
+
+Los valores de las consultas devueltas muestran como la consulta externa a la transacción tiene los valores previos a la misma para garantizar que se cumplen las reglas descritas anteriormente:
+
+<pre>
+(consulta interna a la transacción)
+xmin | xmax | usuario | libro | precio 
+------+------+---------+-------+--------
+(0 rows)
+
+(consulta externa por proceso psql separado)
+xmin | xmax | usuario |     libro     |   precio   
+------+------+---------+---------------+------------
+1685 | 1686 | mike    | 9781593272838 | Eu1.599,00
+(1 row)
+
+(identificador de la transacción)
+txid_current 
+------------
+        1686
+(1 row)
+</pre>
+
+
+

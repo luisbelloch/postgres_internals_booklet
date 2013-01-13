@@ -1,0 +1,14 @@
+<div id="intro">PostgreSQL</div>
+
+13 de enero de 2013
+Luis Belloch <a href="mailto:luisbelloch@gmail.com">luisbelloch@gmail.com</a>
+
+Este documento contiene algunas notas tomadas acerca del funcionamiento interno de PostgreSQL. Algunas referencias pueden no estar correctamente actualizadas.
+
+* "Control de la concurrencia":#concurrencia
+* "Bloqueos":#bloqueos
+* "Índices":#indices
+* "El Planificador de Consultas":#planificador
+* "Fiabilidad y Recuperación":#recuperacion
+* "Foreign data wrappers":#fdw
+* "Bibliografía":#bibliografia

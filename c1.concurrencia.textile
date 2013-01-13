@@ -1,0 +1,107 @@
+h1(#concurrencia). Control de la concurrencia
+
+h2. Niveles de aislamiento en transacciones
+
+Postgres soporta los cuatro tipos de aislamiento definidos en el estándar de SQL. Los tipos de aislamiento se organizan en niveles y refieren a cómo una transacción determinada leerá datos durante su ejecución mientras otras operaciones son ejecutadas simultáneamente.
+
+El nivel de la transacción debe especificarse al comienzo de la transacción mediante @SET TRANSACTION@, la instrucción no tiene efecto alguno sobre transacciones posteriores. Veamos un ejemplo:
+
+<pre>SET TRANSACTION ISOLATION LEVEL READ COMMITED;</pre>
+
+Los niveles disponibles son: _Read uncommited_, _read commited_, _repeatable read_ y _serializable_.
+
+h3. Read Uncommited
+
+Desactiva cualquier tipo de control, es posible obtener efectos no deseados (lecturas sucias, no repetibles o _fantasmas_).
+
+h3. Read Commited
+
+Es el comportamiento por defecto. Postgres garantiza que los datos de una consulta de lectura no serán alterados por otra transacción no confirmada, sólo muestra datos de transacciones confirmadas. Las implicaciones son claras: las transacciones que requieran distintas actualizaciones en múltiples filas no podrán garantizar que otra transacción simultánea no modifica los datos.
+
+En el siguiente ejemplo muestra un caso clásico de dos transacciones que, ejecutadas simultáneamente con el nivel de aislamiento por defecto, podrían dar resultados no deseados - dando lugar a que un cliente no pueda comprar un libro aun estando este disponible.
+
+<pre>-- T1 Un cliente cambia un libro por otro
+UPDATE libro SET stock = stock - 1 WHERE isbn = '9781593272838'
+UPDATE libro SET stock = stock + 1 WHERE isbn = '0521692695'
+
+-- T2 Otro cliente compra un libro, justo entre las dos transacciones anteriores
+UPDATE libro SET stock = stock - 1 WHERE isbn = '0521692695'
+</pre>
+
+h3. Repeatable Read
+
+El funcionamiento es similar al anterior, sólo que la base de datos garantiza que los cambios concurrentes en datos usados por la transacción hacen abortar la misma. En el ejemplo anterior, la modificación causada por @T2@ provocaría que @T1@ tuviera que reiniciar.
+
+Como en este nivel pueden darse errores de serialización, es responsabilidad de la aplicación de tolerar y corregir fallos por actualizaciones concurrentes.
+
+h3. Serializable
+
+Es el nivel de aislamiento más estricto, intenta garantizar que todas las transacciones se ejecutan en fila, una tras otra. Al igual que con @repeatable read@, la aplicación debe estar preparada para reiniciar la transacción en caso de conflicto.
+
+El comportamiento de ejecución secuencial es emulado en Postgres, internamente establece bloqueos en base a los datos que va a manejar la transacción para intentar determinar si la ejecución futura producirá efectos en otras transacciones concurrentes. Los bloqueos pueden verse en la tabla "@pg_locks@":pg_locks, la columna @mode@ se establece al valor @SIReadLock@. En nuestro ejemplo de la biblioteca es fácil comprobar esto desde @psql@:
+
+<pre>
+biblioteca=# BEGIN ISOLATION LEVEL SERIALIZABLE;
+BEGIN
+biblioteca=# SELECT isbn FROM libro;
+      isbn       
+-----------------
+ '9781593272838' 
+ '0521692695'    
+(2 rows)
+
+biblioteca=# SELECT mode, locktype, relation::regclass, page, tuple FROM pg_locks WHERE mode = 'SIReadLock';
+    mode    | locktype | relation | page | tuple 
+------------+----------+----------+------+-------
+ SIReadLock | relation | libro    |      |      
+(1 row)
+</pre>
+
+
+A partir de la versión 9.1 de Postgres se introdujo una mejora llamada _Serializable Snapshot Isolation_ que consiste en construir el grafo de dependencias de las transacciones en progreso para determinar cuándo abortar una de ellas. El funcionamiento está basado en un artículo de [FEKETE] y atiende a la observación de que cada instantánea que contiene una anomalía susceptible de abortar una transacción corresponde a un ciclo en el grafo, el cual contiene dos vértices adyacentes con conflictos de entrada/salida (etiquetados internamente con @rw-conflict@). Según la documentación de los fuentes, es posible incurrir en falsos positivos, ya que no todas las estructuras marcadas como _peligrosas_ producen en realidad un ciclo en el grafo de dependencias.
+
+Las estructuras de datos internas son completamente distintas a la de los locks convencionales en Postgres, los fuentes que controlan el _Predicate Locking_ pueden encontrarse en "predicate.c":src_predicate, en concreto son interesantes las funciones de "CheckForSerializableConflictOut":http://doxygen.postgresql.org/predicate_8c_source.html#l03867 y "CheckForSerializableConflictIn":http://doxygen.postgresql.org/predicate_8c_source.html#l04070. Por ejemplo, en el siguiente fragmento de @predicate.c@, línea 04032, se muestra cómo se marca como no conflictiva una transacción declarada de sólo lectura, que adicionalmente no tiene marcados @rw-conflict@ con otras transacciones confirmadas previamente:
+
+<pre>
+if (SxactIsReadOnly(MySerializableXact)
+    && SxactIsCommitted(sxact)
+    && !SxactHasSummaryConflictOut(sxact)
+    && (!SxactHasConflictOut(sxact)
+        || MySerializableXact->SeqNo.lastCommitBeforeSnapshot < sxact->SeqNo.earliestOutConflictCommit))
+{
+  /* Read-only transaction will appear to run first.  No conflict. */
+  LWLockRelease(SerializableXactHashLock);
+  return;
+}
+</pre>
+
+En el archivo "README-SSI":readmessi de los fuentes hay mucha más información sobre el funcionamiento de los bloqueos requeridos para garantizar el nivel de aislamiento requerido.
+
+h3. Efectos observados según el tipo de aislamiento
+
+La siguiente tabla resume los posibles fallos que pueden derivarse de la selección de uno y otro nivel de aislamiento:
+
+<table>
+<thead>
+  <tr>
+    <th>Nivel</th>
+    <th>Lecturas Sucias</th>
+    <th>Lecturas no repetibles</th>
+    <th>Fantasmas</th>
+  </tr>
+</thead>
+<tbody>
+  <tr><td>Serializable</td><td>&#45;</td><td>&#45;</td><td>&#45;</td></tr>
+  <tr><td>Repeatable Read</td><td>&#45;</td><td>&#45;</td><td>X</td></tr>
+  <tr><td>Read Commited</td><td>&#45;</td><td>X</td><td>X</td></tr>
+  <tr><td>Read Uncommited</td><td>X</td><td>X</td><td>X</td></tr>
+</tbody>
+</table>
+
+[pg_lock]http://www.postgresql.org/docs/9.2/static/view-pg-locks.html
+[src_predicate]http://doxygen.postgresql.org/predicate_8c_source.html
+[readmessi]https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/README-SSI
+
+
+
+
